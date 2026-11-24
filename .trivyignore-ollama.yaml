@@ -1,0 +1,13 @@
+# Exceções do Trivy SOMENTE para a imagem ollama/ollama:0.40.15 (não se aplicam ao OpenJarvis nem ao Caddy).
+# Autorizadas pelo Dev Leader em 2026-11-24. Vencem em 2026-12-24: depois disso o Trivy volta a bloquear.
+vulnerabilities:
+  - id: CVE-2026-109518
+    expired_at: 2026-12-24
+    statement: >-
+      apt/libapt-pkg da base Ubuntu 24.04. O apt nunca é executado no container do Ollama
+      (sem instalação de pacotes em tempo de execução); risco não alcançável na semente.
+  - id: CVE-2026-78661
+    expired_at: 2026-12-24
+    statement: >-
+      golang.org/x/net v0.61.0 (x/net/html) embutido no binário do Ollama. Sem correção em nenhuma
+      release do Ollama (0.40.15 a 0.40.17 usam v0.61.0). O container fica em rede interna, sem saída.

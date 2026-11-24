@@ -9,11 +9,11 @@ on:
       oj_tag:
         description: Tag do OpenJarvis
         required: true
-        default: v1.0.4
+        default: v1.0.5.dev1374
       oj_commit:
         description: Commit esperado da tag (40 hex)
         required: true
-        default: 0eb7811df96cf139e6bd6d7fcc9b5cc4ff1418ff
+        default: a7a43557e14f8b8943672f6a1e4cae8d92008eec
 
 permissions: {}
 
@@ -36,7 +36,7 @@ jobs:
   openjarvis:
     name: openjarvis (${{ matrix.arch }})
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - arch: amd64
@@ -62,7 +62,7 @@ jobs:
 
       - name: Validar entradas
         run: |
-          [[ "$OJ_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag inválida"; exit 1; }
+          [[ "$OJ_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.dev[0-9]+)?$ ]] || { echo "::error::tag inválida"; exit 1; }
           [[ "$OJ_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit inválido"; exit 1; }
           echo "VERSION=${OJ_TAG#v}" >> "$GITHUB_ENV"
 
@@ -84,8 +84,9 @@ jobs:
             git -C src apply "../$p"
             echo "aplicado: $p"
           done
-          if grep -n 'npm install' src/deploy/docker/Dockerfile; then
-            echo "::error::fallback npm install ainda presente"; exit 1
+          # o upstream não pode voltar a ter o fallback que ignora o lockfile
+          if grep -nF '|| npm install' src/deploy/docker/Dockerfile; then
+            echo "::error::fallback '|| npm install' presente no Dockerfile"; exit 1
           fi
 
       - name: Builder BuildKit fixado por digest
@@ -181,7 +182,7 @@ jobs:
   base:
     name: varredura ollama + caddy (${{ matrix.arch }})
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - arch: amd64
@@ -190,18 +191,31 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
-    permissions: {}
+    permissions:
+      contents: read
     env:
       ARCH: ${{ matrix.arch }}
     steps:
-      - name: Trivy por digest
+      - name: Checkout (arquivo de exceções)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Trivy por digest (varre todas, falha no fim)
         run: |
-          for ref in "$OLLAMA_SRC" "$CADDY_SRC"; do
-            docker pull --quiet --platform "linux/$ARCH" "$ref"
+          falhas=0
+          varrer() {  # $1 = imagem, $2 = arquivo de exceções (opcional, só para essa imagem)
+            local extra=()
+            if [ -n "${2:-}" ]; then extra=(-v "$PWD/$2:/ignore.yaml:ro"); fi
+            docker pull --quiet --platform "linux/$ARCH" "$1"
             docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-              -v "$HOME/.cache/trivy:/root/.cache/trivy" "$TRIVY" \
-              image --quiet --platform "linux/$ARCH" --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$ref"
-          done
+              -v "$HOME/.cache/trivy:/root/.cache/trivy" "${extra[@]}" "$TRIVY" \
+              image --quiet --platform "linux/$ARCH" --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+              ${2:+--ignorefile /ignore.yaml} "$1" || { echo "::error::achados em $1"; falhas=1; }
+          }
+          varrer "$OLLAMA_SRC" .trivyignore-ollama.yaml
+          varrer "$CADDY_SRC"
+          exit "$falhas"
 
   index:
     name: índice multi-arch + atestado

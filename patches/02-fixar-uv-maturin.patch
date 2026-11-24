@@ -1,9 +1,9 @@
-# its-iappa-seed: modifica deploy/docker/Dockerfile do OpenJarvis (Apache-2.0), tag v1.0.4.
+# its-iappa-seed: modifica deploy/docker/Dockerfile do OpenJarvis (Apache-2.0), tag v1.0.5.dev1374.
 # Motivo: uv sem versão e maturin em faixa; versões exatas tornam o build reprodutível.
 
 --- a/deploy/docker/Dockerfile
 +++ b/deploy/docker/Dockerfile
-@@ -36,10 +36,10 @@
+@@ -37,10 +37,10 @@
  # separate layer from the source copy so dependency installs stay cached when
  # only application code changes.
  COPY pyproject.toml uv.lock README.md ./
