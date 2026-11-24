@@ -1,0 +1,262 @@
+# Build da imagem OpenJarvis da semente its-iappa-seed, com proveniência e SBOM assinados.
+# Sem ações de terceiros: só ações do GitHub, fixadas por SHA. Ferramentas externas (BuildKit, Trivy)
+# entram como imagens fixadas por digest. Ollama e Caddy são só varridos (a semente baixa os originais por digest).
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      oj_tag:
+        description: Tag do OpenJarvis
+        required: true
+        default: v1.0.4
+      oj_commit:
+        description: Commit esperado da tag (40 hex)
+        required: true
+        default: 0eb7811df96cf139e6bd6d7fcc9b5cc4ff1418ff
+
+permissions: {}
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: ghcr.io/iappapedroza/its-iappa-seed-openjarvis
+  BUILDKIT: moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+  TRIVY: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+  OLLAMA_SRC: ollama/ollama:0.40.15@sha256:0e59999e0e8f9fd4e704bd788a89b7e4cad399367fb1365f8c102ac662288761
+  CADDY_SRC: caddy:2.11.9@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
+
+jobs:
+  openjarvis:
+    name: openjarvis (${{ matrix.arch }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      ARCH: ${{ matrix.arch }}
+      OJ_TAG: ${{ inputs.oj_tag }}
+      OJ_COMMIT: ${{ inputs.oj_commit }}
+    steps:
+      - name: Checkout deste repositório
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validar entradas
+        run: |
+          [[ "$OJ_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag inválida"; exit 1; }
+          [[ "$OJ_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit inválido"; exit 1; }
+          echo "VERSION=${OJ_TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Clonar OpenJarvis e conferir o commit
+        run: |
+          git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$OJ_TAG" \
+            https://github.com/open-jarvis/OpenJarvis.git src
+          atual=$(git -C src rev-parse HEAD)
+          if [ "$atual" != "$OJ_COMMIT" ]; then
+            echo "::error::a tag $OJ_TAG aponta para $atual, esperado $OJ_COMMIT"; exit 1
+          fi
+          # Datas da imagem derivadas do commit: build reprodutível e varrida == publicada
+          echo "SOURCE_DATE_EPOCH=$(git -C src log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - name: Aplicar patches
+        run: |
+          for p in patches/*.patch; do
+            git -C src apply --check "../$p"
+            git -C src apply "../$p"
+            echo "aplicado: $p"
+          done
+          if grep -n 'npm install' src/deploy/docker/Dockerfile; then
+            echo "::error::fallback npm install ainda presente"; exit 1
+          fi
+
+      - name: Builder BuildKit fixado por digest
+        run: |
+          docker buildx create --name seed --driver docker-container \
+            --driver-opt "image=$BUILDKIT" --use
+          docker buildx inspect --bootstrap
+
+      - name: Build local (para varredura)
+        run: |
+          docker buildx build --platform "linux/$ARCH" \
+            -f src/deploy/docker/Dockerfile \
+            --label "org.opencontainers.image.title=its-iappa-seed-openjarvis" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$OJ_COMMIT" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.licenses=Apache-2.0" \
+            --label "io.its-iappa.upstream.source=https://github.com/open-jarvis/OpenJarvis" \
+            --label "io.its-iappa.upstream.revision=$OJ_COMMIT" \
+            --label "io.its-iappa.patches=$(cd patches && ls *.patch | paste -sd, -)" \
+            --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+            --provenance=false \
+            --metadata-file meta-local.json \
+            --load -t local/openjarvis:scan src
+
+      - name: Trivy (bloqueia HIGH/CRITICAL com correção) e SBOM
+        run: |
+          mkdir -p out
+          trivy() { docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" -v "$PWD/out:/out" "$TRIVY" "$@"; }
+          trivy image --quiet --platform "linux/$ARCH" --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 local/openjarvis:scan
+          trivy image --quiet --platform "linux/$ARCH" --format spdx-json --output /out/sbom.spdx.json local/openjarvis:scan
+
+      - name: Login no GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build e push por digest (mesmo cache; proveniência BuildKit max)
+        id: push
+        run: |
+          docker buildx build --platform "linux/$ARCH" \
+            -f src/deploy/docker/Dockerfile \
+            --label "org.opencontainers.image.title=its-iappa-seed-openjarvis" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$OJ_COMMIT" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.licenses=Apache-2.0" \
+            --label "io.its-iappa.upstream.source=https://github.com/open-jarvis/OpenJarvis" \
+            --label "io.its-iappa.upstream.revision=$OJ_COMMIT" \
+            --label "io.its-iappa.patches=$(cd patches && ls *.patch | paste -sd, -)" \
+            --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+            --provenance=mode=max \
+            --metadata-file meta-push.json \
+            --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" src
+          local_cfg=$(jq -r '."containerimage.config.digest"' meta-local.json)
+          push_cfg=$(jq -r '."containerimage.config.digest"' meta-push.json)
+          if [ "$local_cfg" != "$push_cfg" ] || [ "$push_cfg" = "null" ]; then
+            echo "::error::imagem publicada difere da varrida ($local_cfg x $push_cfg)"; exit 1
+          fi
+          digest=$(jq -r '."containerimage.digest"' meta-push.json)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::digest inválido"; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          mkdir -p digests && printf '%s' "$digest" > "digests/$ARCH"
+
+      - name: Atestar proveniência
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Atestar SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: out/sbom.spdx.json
+          push-to-registry: true
+
+      - name: Guardar digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Logout
+        if: always()
+        run: docker logout ghcr.io || true
+
+  base:
+    name: varredura ollama + caddy (${{ matrix.arch }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions: {}
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Trivy por digest
+        run: |
+          for ref in "$OLLAMA_SRC" "$CADDY_SRC"; do
+            docker pull --quiet --platform "linux/$ARCH" "$ref"
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$HOME/.cache/trivy:/root/.cache/trivy" "$TRIVY" \
+              image --quiet --platform "linux/$ARCH" --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$ref"
+          done
+
+  index:
+    name: índice multi-arch + atestado
+    needs: [openjarvis, base]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      OJ_TAG: ${{ inputs.oj_tag }}
+      OJ_COMMIT: ${{ inputs.oj_commit }}
+    steps:
+      - name: Baixar digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Login no GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Criar índice
+        id: index
+        run: |
+          VERSION=${OJ_TAG#v}
+          amd=$(cat digests/amd64); arm=$(cat digests/arm64)
+          for d in "$amd" "$arm"; do [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::digest inválido"; exit 1; }; done
+          docker buildx imagetools create -t "$IMAGE:$VERSION" "$IMAGE@$amd" "$IMAGE@$arm"
+          idx=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          [[ "$idx" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::digest do índice inválido"; exit 1; }
+          echo "digest=$idx" >> "$GITHUB_OUTPUT"
+          {
+            echo "## its-iappa-seed-openjarvis $VERSION"
+            echo
+            echo "| Alvo | Digest |"
+            echo "|---|---|"
+            echo "| índice | \`$IMAGE@$idx\` |"
+            echo "| linux/amd64 | \`$IMAGE@$amd\` |"
+            echo "| linux/arm64 | \`$IMAGE@$arm\` |"
+            echo
+            echo "OpenJarvis $OJ_TAG, commit \`$OJ_COMMIT\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Atestar proveniência do índice
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+
+      - name: Logout
+        if: always()
+        run: docker logout ghcr.io || true

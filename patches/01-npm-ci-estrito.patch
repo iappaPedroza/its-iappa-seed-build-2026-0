@@ -1,0 +1,14 @@
+# its-iappa-seed: modifica deploy/docker/Dockerfile do OpenJarvis (Apache-2.0), tag v1.0.4.
+# Motivo: o fallback '|| npm install' ignora o lockfile e roda scripts de instalação; o build deve falhar.
+
+--- a/deploy/docker/Dockerfile
++++ b/deploy/docker/Dockerfile
+@@ -10,7 +10,7 @@
+ 
+ WORKDIR /frontend
+ COPY frontend/package.json frontend/package-lock.json* ./
+-RUN npm ci --ignore-scripts 2>/dev/null || npm install
++RUN npm ci --ignore-scripts
+ COPY frontend/ .
+ RUN VITE_SUPABASE_ANON_KEY="${OPENJARVIS_LEADERBOARD_PUBLIC_ANON}" npm run build
+ 
