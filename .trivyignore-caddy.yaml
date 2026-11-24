@@ -1,0 +1,9 @@
+# Exceção do Trivy SOMENTE para a imagem caddy:2.11.9 (não se aplica ao OpenJarvis nem ao Ollama).
+# Pendente de autorização do Dev Leader. Vence em 2026-12-24: depois disso o Trivy volta a bloquear.
+vulnerabilities:
+  - id: CVE-2026-78661
+    expired_at: 2026-12-24
+    statement: >-
+      golang.org/x/net v0.60.0 (x/net/html) embutido no binário do Caddy 2.11.9, que é a release mais recente.
+      A correção (v0.62.0) já está no master do Caddy, sem release. Nenhum arquivo .go do Caddy v2.11.9 importa
+      golang.org/x/net/html (dependência transitiva); o Caddyfile da semente só usa reverse_proxy, em 127.0.0.1.

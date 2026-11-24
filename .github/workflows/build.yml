@@ -142,13 +142,19 @@ jobs:
             --provenance=mode=max \
             --metadata-file meta-push.json \
             --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" src
-          local_cfg=$(jq -r '."containerimage.config.digest"' meta-local.json)
-          push_cfg=$(jq -r '."containerimage.config.digest"' meta-push.json)
-          if [ "$local_cfg" != "$push_cfg" ] || [ "$push_cfg" = "null" ]; then
-            echo "::error::imagem publicada difere da varrida ($local_cfg x $push_cfg)"; exit 1
-          fi
           digest=$(jq -r '."containerimage.digest"' meta-push.json)
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::digest inválido"; exit 1; }
+          # Com proveniência, o push vira um índice (imagem + manifesto de atestado) e o metadata não traz
+          # o config. Lê do registro o manifesto da plataforma e compara o config com o da imagem varrida.
+          local_cfg=$(jq -r '."containerimage.config.digest"' meta-local.json)
+          plat=$(docker buildx imagetools inspect "$IMAGE@$digest" --raw \
+            | jq -r --arg a "$ARCH" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest')
+          [[ "$plat" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::manifesto linux/$ARCH não encontrado no índice"; exit 1; }
+          push_cfg=$(docker buildx imagetools inspect "$IMAGE@$plat" --raw | jq -r '.config.digest')
+          if [ "$local_cfg" = "null" ] || [ "$local_cfg" != "$push_cfg" ]; then
+            echo "::error::imagem publicada difere da varrida ($local_cfg x $push_cfg)"; exit 1
+          fi
+          echo "varrida == publicada: config $push_cfg, manifesto $plat"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           mkdir -p digests && printf '%s' "$digest" > "digests/$ARCH"
 
@@ -214,7 +220,7 @@ jobs:
               ${2:+--ignorefile /ignore.yaml} "$1" || { echo "::error::achados em $1"; falhas=1; }
           }
           varrer "$OLLAMA_SRC" .trivyignore-ollama.yaml
-          varrer "$CADDY_SRC"
+          varrer "$CADDY_SRC" .trivyignore-caddy.yaml
           exit "$falhas"
 
   index:
