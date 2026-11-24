@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # Só atualiza os SHAs das ações; cada atualização vira PR para revisão.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
